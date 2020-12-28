@@ -1,0 +1,630 @@
+---
+title: 'STAT 542: Project'
+author: "FALL 2020, by Siyuan Pang (spang8)"
+date: 'Due: Dec 11, 11:59 PM CT'
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+  
+---
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(include = TRUE)  # TRUE for solution; FALSE for questions set
+  knitr::opts_chunk$set(echo = TRUE)
+  knitr::opts_chunk$set(message = FALSE)
+  knitr::opts_chunk$set(warning = FALSE)
+  knitr::opts_chunk$set(fig.height = 6, fig.width = 8, out.width = '80%', fig.align = "center")
+  options(width = 90)
+```
+
+```{css, echo=FALSE}
+.solution {
+background-color: #e6ffe6;
+}
+```
+
+
+Read data
+```{r Read_data}
+require(data.table)
+data = fread("microbiome_542.csv")
+```
+
+# Data processing and feature engineering
+
+Since demographic dataset is all cateigorical data and is not sparse, while biome dataset is very sparse. I process the two datasets seperately.
+```{r split 2 datasets}
+# divide data into two groups: demographic data and microbiome datasetes. 
+demo = data[ , c(6, 7)]  # race, sex
+bio = data[ , c(9:32962)]         # all biome data
+```
+
+
+Since the demographic data are all discontinous data, observations with missing values are deleted.  
+```{r demographic_dataprocess}
+# clean demographic dataset
+# Remove missing data from demo dataset
+demo[demo == 'Not provided'] = NA   # replace 'Not provided' value with NA
+demo = demo[complete.cases(demo), ]
+dim(demo)
+```
+
+
+biome data is very sparse. The sparsity level = 99.4%. The 'metagenomeSeq' package is used to process the sparsity issues. data is trim to reduce dimension according to abundance. Features that less than the average number of effective samples in all features are revomed, such that the features left over are present more than 1% of the subjects. The bio data dimension becomes to (9511x1824). Normalization is performed due to varing depths of coverage across samples.
+```{r biodata_trimFeatures}
+# level of sparsity
+sparse_bio = sum(bio == 0) / (nrow(bio) * ncol(bio))
+
+# install 'metagenomeSeq' package 
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#install.packages("BiocManager")
+#BiocManager::install("metagenomeSeq")
+#BiocManager::install("biomformat")
+#BiocManager::install("interactiveDisplay")
+library(metagenomeSeq)
+library(biomformat)
+# vignette("metagenomeSeq") # package document
+#bio = data[ , c(1,9:32962)] 
+bio_obj = newMRexperiment(bio)  # create a MRexperiment object 
+rareFeatures = which(colSums(MRcounts(bio_obj) > 0) < 100)  # set trim value
+bio_trim = bio_obj[ ,-rareFeatures]
+
+dim(bio_trim)
+percentile = cumNormStat(bio_trim, pFlag=TRUE, main="Trimmed biome data")  # normalization factor
+bio_trim_norm = cumNorm(bio_trim, p = percentile)  # normalization
+
+bio_trim = MRcounts(bio_trim_norm, norm = TRUE, log = TRUE) # turn object to dataframe 
+```
+
+The key function here is the 0 replacement function cmultRepl which has many options [12]. After fill 0, samples that are less than 1e-4% abundant in any sample are removed, resulting the bio dataset dimension of 6963x1824. Lastly, convert the OTUs proportional data to the centred log-ratio. (show equation)   
+
+By cleaning the column names, we found there are 12 unique bacteria taxa: "Cyanobacteria", "Bacteroidetes", "Firmicutes", "Verrucomicrobia", "Synergistetes", "Proteobacteria", "Euryarchaeota", "Actinobacteria", "Lentisphaerae", "Fusobacteria", "Tenericutes|", and "Thermi". 
+
+```{r biome_data_imputation}
+# load the required R packages
+library(compositions) # exploratory data analysis of compositional data
+require(zCompositions) # used for 0 substitution
+require(ALDEx2) # used for per-OTU comparisons
+require(xtable) # used to generate tables from datasets
+library(igraph) # used to generate graphs from phi data
+library(car) # used to generate graphs from phi data
+# you will need to download this directly from github
+# I put the files in a directory called git at the base of my user space
+# https://github.com/ggloor/propr
+# source("/Users/sye/Box/542/PROJECT/CJM_Supplement-master/chunk/functions.R") # rename proprBayes to propr
+
+# imputation: replace 0 in dataset using cmultRepl function 
+bio_trim_fill = t(cmultRepl(t(bio_trim), method="CZM", output="prop"))
+
+# remove samples that are less than 1e-4% abundant in any sample
+bio_trim2 = bio_trim_fill[apply(bio_trim_fill, 1, min) > 0.000001, ]
+dim(bio_trim2)
+
+
+# rename taxa 
+name = colnames(bio_trim2)
+name_clean = gsub('.*p__', '',name)    # remove string before 'p__'
+colnames(bio_trim2) = name_clean
+
+taxa = gsub('|c__.*', '', name_clean) # taxa of each column
+unique_taxa = unique(taxa)
+
+
+# sort sample by abundance
+index_order = order(apply(bio_trim2, 1, sum), decreasing = TRUE)
+
+# get the sample by ordered abundance
+bio_trim2_ordered = bio_trim2[index_order, ]
+
+# convert to centred log-ratio
+# rows: samples, col: taxa
+bio_log = apply(bio_trim2_ordered, 2, function(x){log(x) - mean(log(x))})
+
+# rows: taxa, col: samples
+bio_log_t = t(apply(bio_trim2_ordered, 2, function(x){log(x) - mean(log(x))}))
+
+
+```
+
+
+# Unsupervised learning - Clustering  
+PCA is performed to find the potential relation between biome data. It can be seen from figure XX that most biome data have large variation projected on PC1 and provides most of useful informatoin. The first 10 principle components are shown. The first 2 components explain 0.20 and 0.03 of the variance in the data.  
+
+The covariance biplot made from the abundance trimed dataset are shown in Figure XX. The ray in this figure show the amount of variance exhibit by each taxon relative to the PC center. The longer rays mean more variance across samples. k__Bacteria|p__Firmicutes|c__Clostridia|o__Clostridiales|f__Ruminococcaceae|g__Ruminococcaceae|s__Ruminococcaceae-unspecified.73 has the longest ray, indicating it exhibits the most variation relative t all taxa across samples. On ther other hand, k__Bacteria|p__Firmicutes|c__Clostridia|o__Clostridiales|f__Clostridiales|g__Clostridiales|s__Clostridiales-unspecified.215 has the shortest ray.  
+
+The corelation of the abundance of 2 taxa can be seen from the angle of rays. If the 2 rays are orthogonal, that means the 2 taxa are uncorrelated. 
+
+The sample 2355 is the least similar to any other sample because it is furthest from the PC center. The sample 654 is the most similar to any other sample as it is the closest to the center.  
+
+
+```{r PCA_bio}
+pca_bio = prcomp(bio_log)
+
+# plot first 10 PCs variance
+pc_percent = pca_bio$sdev^2 / mvar(bio_log) # all pc variance
+barplot(pc_percent[1:10], xlab = 'First 10 components', ylab = 'Variance explained')  # first 10 pc variance
+
+# covariance biplot
+biplot(pca_bio, col = c('black', 'red'), cex = c(0.6,0.5),
+       arrow.len=0.5,
+       xlab= paste('PC1', round(pc_percent[1], 3), sep = ' '),
+       ylab= paste('PC2', round(pc_percent[2], 3), sep = ' ')
+       )
+
+
+# the distance to the PC origin
+pca_x = pca_bio$x[,1:2]  # PC1 and PC2 coordinates for all features
+pca_x_origin = rbind(c(0,0), pca_x)  # include origin coordinates 
+dist_all = as.matrix(dist(pca_x_origin))  # distance between all points
+dist_to_origin = dist_all[-1, 1]  # ditance of each points to origin
+which.max(dist_to_origin)
+which.min(dist_to_origin)
+
+```
+
+To find the number of clusters of bio data, the sum of squre distance winthin clusters (WSS) are calculated by varing the number of clusters from 2 to 20. According the the FigureXX, the WSS decreases as the number of clusters increases. The drops are large until the we have 6 clusters. Thus, a kmeans model is built with number of clusters = 6. Since the variables are ordered by the abundance, the first 2 variables are plot in FigureXX showing the 
+
+```{r kmeans}
+# within group sum of squares(wss)
+wss = c()
+for(i in 2:20){
+  km = kmeans(bio_log, center = i)
+  wss[i] = sum(km$withinss)
+}
+plot(wss, type = 'b', xlab = 'Number of clusters', ylab = 'Within group sum of square')
+
+kmeans.fit = kmeans(bio_log, center = 6)
+cluster_kmeans = kmeans.fit$cluster
+
+plot(bio_log[,1], bio_log[,2], col = cluster_kmeans, xlab = colnames(bio_log)[1], ylab = colnames(bio_log)[2], cex.lab = 0.65)
+
+```
+
+
+
+Figure XX is the hierarchical cluster dendrogram. The ward.D2 method is used to cluster groups together by their squared distance from the geometric mean distance of the group. Since there are 12 differernt types of bacterial, the color of dendrogram is shown for 12 classes. 
+
+The heatmaps are plot in Figure xx helps discover potential patterns. It recognize the samples and taxa based on the clusters. The darker regions imply those data are highly correlated. We can take those as subgroup of data. Comparing with the data before sparsity process, little relations or patterns can be seen from the heapmap as shown in FigureXX. Thus, the sparsity issue largely affect clustering results. 
+
+```{r h-clustering_t}
+### process bio data with row: taxa, col: samples
+
+library(dendextend)
+# generate distance matrix
+dd_t = dist(bio_log_t, method = 'euclidian')
+
+# h-cluster
+hc_t = hclust(dd_t, method = 'ward.D2')
+
+# cluster dendrites
+plot(hc_t, cex = 0.1, hang = -1)
+dend = as.dendrogram(hc_t)
+branch = color_branches(dend, k=6)
+plot(branch)
+
+
+# heatmap
+library(heatmap.plus)
+library(RColorBrewer)
+library(gplots)
+
+d = function(x) dist(x, method = 'euclidian')
+h = function(x) hclust(x, method = 'ward.D2')
+
+cl.col = h(d(t(bio_log_t)))      # calc h-cluster
+cluster_hc = cutree(cl.col, 6)   # define 6 clusters
+
+col = brewer.pal(6, 'Pastel1')   # special colors for each cluster
+
+heatmap_bar = heatmap.2(bio_log_t, trace = 'none', density = 'none', col = bluered(20),
+          hclustfun = h, 
+          distfun = d,
+          ColSideColors = col[cluster_hc],
+          cexRow = 0.5, cexCol = 0.5,
+          )
+
+```
+
+
+```{r h-clustering}
+### process bio data with row: samples, col: taxa
+
+# generate distance matrix
+dd = dist(bio_log, method = 'euclidian')
+
+# h-cluster
+hc = hclust(dd, method = 'ward.D2')
+a = hc$order
+which(a == 3000)
+length(a)
+# cluster dendrites
+member = cutree(hc, 3)  # cluster samples into 3 clusters
+plot(hc, cex = 0.1, hang = -1, col = member)
+
+# heatmap
+heatmap = heatmap(bio_log)
+
+
+```
+
+
+
+The adjacency matrix is built and the eigen-values are computed by eigen decomposition. The clustered results of spectral clustering and kmeans clustering are different. Contrast to kmeans, clusters in spectral clustering are not assumed to be any certain shape.
+```{r spectral clustering}
+# construct the adjacency matrix
+W = as.matrix(exp(-dist(as.matrix(bio_log))^2) / 4)  # similarity matrix
+d = colSums(W)     # compute the degree of each vertex
+L = diag(d) - W    # the laplacian matrix
+f = eigen(L, symmetric = TRUE)    # eigen decomposition
+
+spec = kmeans(f$vectors, center = 6)
+cluster_spec = spec$cluster
+plot(bio_log[,1],bio_log[,2], col = cluster_spec, xlab = colnames(bio_log)[1], ylab = colnames(bio_log)[2], cex.lab = 1.3)
+
+```
+
+
+
+# Supervused learning - Classification  
+
+## SVM classification
+
+Take compositional data as input, BMI categorical data as output to build XXX model.  
+
+[feature selection paper, why need to select features]. MetabiomeSeq is used again to shrink the feature size. Imputation is performed and data are convert to centred log-ratio.  
+The missing rate in bmi_cat = 5.7%. It's OK to remove those amount of observations.  
+
+A grid of parameters $\gamma$ and cost are tunned by 10-fold cross validation to get the best performance for the best performance. The fitted SVM model with RBF kernel gives the prediction accuracy = 97% with confidence interval between 96% - 99%. The confusion matrix is shown. However, the testing error only reaches 47%. [ref. rf and LDA]
+
+```{r SVM} 
+library(e1071) 
+library(caret)
+
+###############################################################
+#feature selection using metabiomeSeq and imputation
+###############################################################
+bio_obj = newMRexperiment(bio)  # create a MRexperiment object 
+rareFeatures = which(colSums(MRcounts(bio_obj) > 0) < 4000)  # set feature trim value
+bio_trim_svm = bio_obj[ ,-rareFeatures]
+dim(bio_trim_svm)
+
+percentile = cumNormStat(bio_trim, pFlag=TRUE, main="Trimmed biome datafor SVM")  # normalization factor
+bio_trim_norm = cumNorm(bio_trim_svm, p = percentile)  # normalization
+bio_svm = MRcounts(bio_trim_norm, norm = TRUE, log = TRUE) # turn object to dataframe 
+
+# imputation: replace 0 in dataset 
+bio_svm_fill = t(cmultRepl(t(bio_svm), method="CZM", output="prop"))
+
+# remove samples that are less than 1e-3% abundant in any sample
+bio_svm_trim2 = bio_svm_fill[apply(bio_svm_fill, 1, min) > 0.00001, ] # set obs trim value
+dim(bio_svm_trim2)
+
+# rename taxa 
+name = colnames(bio_svm_trim2)
+name_clean = gsub('.*p__', '',name)    # remove string before 'p__'
+colnames(bio_svm_trim2) = name_clean
+
+# convert to centred log-ratio
+# rows: samples, col: taxa
+bio_log_svm = apply(bio_svm_trim2, 2, function(x){log(x) - mean(log(x))})
+dim(bio_log_svm)
+
+
+###############################################################
+# build SVM model
+###############################################################
+# X and y used in SVM
+ind = as.integer(row.names(bio_log_svm))  #index of reordered bio_log data
+bmi_cat = data[ind, 4]  # true y: bmi categorical
+df_svm = data.frame(bio_log_svm, bmi_cat)
+dim(df_svm)
+
+# check NA in bmi
+df_svm[df_svm == 'Not provided'] = NA   # replace 'Not provided' value with NA
+miss_rate = sum(is.na(df_svm)) / nrow(df_svm)   # missing rate in bmi_cat data
+df_svm = df_svm[complete.cases(df_svm), ]  # Remove missing data from demo dataset
+dim(df_svm)
+
+df_svm$bmi_cat = as.factor(df_svm$bmi_cat)  # convert bmi_cat to factor
+
+# split data into training and testing datasets
+#set.seed(1)
+#train_id = sample(nrow(df_svm), size = floor(0.8 * nrow(df_svm)))
+#train_svm = df_svm[train_id, ]
+#test_svm = df_svm[-train_id, ]
+
+# tunning parameters
+obj = tune(svm, bmi_cat~., data = df_svm,
+           ranges = list(gamma = 2^(-5:0), cost = 2^(1:5)),
+           tunecontrol = tune.control(sampling = 'fix')
+           )
+summary(obj)
+plot(obj)
+
+# build model
+svm.fit = svm(bmi_cat ~. , data = df_svm,
+              type = 'C-classification',
+              kernel = 'linear',
+              scale = FALSE,
+              gamma = 0.125,
+              cost = 2)
+
+pred_svm = predict(svm.fit, df_svm) 
+confusionMatrix(pred_svm, df_svm$bmi_cat)
+
+pred_test_svm = predict(svm.fit, test_svm) 
+confusionMatrix(pred_test_svm, test_svm$bmi_cat)
+```
+
+
+
+## Random forest classification  
+Use compositional data as input to build a random forest model to predict alcohol frequency. The compositional data processing is the same as that performed in SVM section. The missing rate in alcohol frequency = 1.38%. Those missing observations are deleted. Parameters mtry, ntree, and nodesize are tuned according to 10-fold cross-validation. The optimal mtry = 3, ntree = 200, nodesize = 3.
+
+The random forest model has accuracy 96.8% with 0.95 confidence interval between 94% - 98%. Again, the testing error is large, testing accuracy = 20%.  
+
+```{r Random forest}
+library(randomForest)
+##################### predict alcohol
+# X and y used in rf
+alcohol = data[ind, 8]  # true y: alcohol freq categorical
+df_rf = data.frame(bio_log_svm, alcohol)
+dim(df_rf)
+
+# check NA in alcohol
+df_rf[df_rf == 'Not provided'] = NA   # replace 'Not provided' value with NA
+miss_rate = sum(is.na(df_rf)) / nrow(df_rf)   # missing rate in alcohol data
+df_rf = df_rf[complete.cases(df_rf), ]  # Remove missing data from demo dataset
+dim(df_rf)
+
+df_rf$alcohol_frequency = as.factor(df_rf$alcohol_frequency)  # convert bmi_cat to factor
+
+# tune mtry, ntree, nodesize 
+RFobj <- tune(randomForest, alcohol_frequency~., data = df_rf,
+              ranges = list(mtry=c(1:5), ntree=c(100,200,500),nodesize=c(3,5,10)),
+              tunecontrol = tune.control(sampling = "fix")
+             )
+summary(RFobj)
+
+# best model to do classcification
+rf.fit <- randomForest(alcohol_frequency~., data=df_rf, mtry=3,ntree=200,nodesize = 3,importance=TRUE)
+
+prediction <- predict(rf.fit, df_rf)
+
+# confusion matrix
+confusionMatrix(prediction, df_rf$alcohol_frequency, dnn = c("Prediction", "Reference"))
+summary(rf.fit, method = permutation.test.gbm)
+```
+
+
+
+## KNN classification  
+KNN is performed to predict bmi_cat using demographic variable race and sex as inputs. The parameter k is tunned with a grid 1 to 20. The testing error of knn model is 57.4%. KNN is not a good choice in this situation. Inputs race and sex are categorical data. They are trainsformed to dummies in prediction. While the output is also categorical data, the model results too many ties in probability prediction. Thus, all the classification become "normal". 
+```{r}
+library(caret)
+
+# X and y 
+demo = data[ , c(6,7)]  # X = race, sex
+df_knn = data.frame(demo, data[ ,4])   # y = bmi_cat
+
+# check NA in alcohol
+df_knn[df_knn == 'Not provided'] = NA   # replace 'Not provided' value with NA
+df_knn[df_knn == 'Other'] = NA   # replace 'Other' value with NA
+miss_rate = sum(is.na(df_knn)) / nrow(df_knn)   # missing rate in bmi_cat data
+df_knn = df_knn[complete.cases(df_knn), ]  # Remove missing data from demo dataset
+dim(df_knn)
+
+df_knn$bmi_cat = as.factor(df_knn$bmi_cat)  
+ 
+# split data into training and testing datasets
+set.seed(1)
+train_id = sample(nrow(df_knn), size = floor(0.2* nrow(df_knn))) #0.6 then 0.2
+train_knn = df_knn[train_id, ] 
+test_knn = df_knn[-train_id, ]
+
+# tune parameter
+acc = c()
+for(k in 1:30){
+  knn.fit = knn3(bmi_cat~., data = train_knn, k = k)
+  pred_knn = predict(knn.fit, test_knn, type = 'class')
+  acc[k] = mean(pred_knn == test_knn$bmi_cat)
+}
+k = which.max(acc)
+
+# knn model
+knn.fit = knn3(bmi_cat~., data = train_knn, k = k)
+
+# train error
+pred_train_knn = predict(knn.fit, train_knn, type = 'class')
+confusionMatrix(pred_train_knn, train_knn$bmi_cat)
+
+# test error
+pred_test_knn = predict(knn.fit, test_knn, type = 'class')
+confusionMatrix(pred_test_knn, test_knn$bmi_cat)
+
+```
+
+# Regression   
+## Lasso regression  
+Lasso regression has a variable selection property, which may shrink some coefficient to 0 if the effect of that variable is small. Take compositional variables as input, bmi as output to build Lasso model.  
+
+Remove missing values which occupies 2.6% in bmi. In addition, there are obvious invalid bmi values which are extrmely large. Thus, bmi that are larger than 100 are removed.  
+
+10-fold cross validation is performed to find the optimal lambda. Figure XXX shows how error change with log lambda. lambda = 0.8485 to reduce the error. 
+
+Add xlab = 'Compositional features', ylab = 'Beta coef in Lasso' to barplot.  
+FigureXXX shows the features importance according to Lasso coefficient. TableXXX lists the top 20 important compositional features in order. "Firmicutes.c__Clostridia.o__Clostridiales.f__Clostridiales.g__Clostridiales.s__Clostridiales.unspecified.11", "Firmicutes.c__Clostridia.o__Clostridiales.f__Lachnospiraceae.g__Dorea.s__Dorea.unspecified.3", and "Firmicutes.c__Clostridia.o__Clostridiales.f__Clostridiales.g__Clostridiales.s__Clostridiales.unspecified.34" are the most important features in determining the bmi value in Lasso model.  
+
+Use lambda = 0.8485 to build the Lasso model with training data. The training error = 39.31, and the testing error = 46.64.
+
+```{r Lasso}
+library(glmnet)
+
+# X and y used in Lasso
+bio_log_lasso = bio_log_svm   # X
+ind = as.integer(row.names(bio_log_lasso))  #index of reordered bio_log data
+bmi = data[ind, 3]  # true y: bmi 
+df_lasso = data.frame(bio_log_lasso, bmi)
+dim(df_lasso)
+
+# check NA in bmi
+df_lasso[df_lasso == 'Not provided'] = NA   # replace 'Not provided' value with NA
+miss_rate = sum(is.na(df_lasso)) / nrow(df_lasso)   # missing rate in bmi_cat data
+df_lasso = df_lasso[complete.cases(df_lasso), ]  # Remove missing data 
+dim(df_lasso)
+
+# remove bmi obs with bmi > 100
+df_lasso[ ,94] = as.numeric(df_lasso[ ,94])   # change bmi to numerics
+df_lasso[df_lasso[ ,94] > 100, 94] = NA
+df_lasso = df_lasso[complete.cases(df_lasso), ]  # Remove missing data 
+dim(df_lasso)
+
+# split training and testing datasets
+set.seed(1)
+train_id = sample(nrow(df_lasso), size = floor(0.8* nrow(df_lasso))) 
+train_lasso = df_lasso[train_id, ] 
+test_lasso = df_lasso[-train_id, ]
+
+# build lasso model 
+set.seed(3)
+lasso.fit = cv.glmnet(data.matrix(train_lasso[ ,1:93]), train_lasso$bmi, nfolds = 10)
+
+# plot important features according to coef
+feature_ind = order(abs(coef(lasso.fit, s = 'lambda.min')[-1]), decreasing = TRUE)   # ordered col index based on coef
+features_ordered = colnames(df_lasso)[feature_ind]    # ordered feature names 
+coef_ordered = sort(abs(coef(lasso.fit, s = 'lambda.min')[-1]), decreasing = TRUE)
+barplot(coef_ordered[1:20], names.arg = features_ordered[1:20], las = 2)
+
+plot(lasso.fit)
+
+# prediction
+lasso = glmnet(data.matrix(train_lasso[ ,1:93]), train_lasso$bmi, lambda = 0.8485)
+
+pred_train = predict(lasso, as.matrix(train_lasso[ ,1:93]))
+mse_train = mean((pred_train - train_lasso$bmi)^2)
+
+pred_test = predict(lasso, as.matrix(test_lasso[ ,1:93]))
+mse_test = mean((pred_test - test_lasso$bmi)^2)
+```
+
+
+## random forest   
+Age, weight, race, and sex are taken as input. BMI is the output.  
+Data cleaning: 1) Observations that contains "Not provided" are removed. 2) In age column, 'child' is defind as 10s, and 'teen' is defined as 20s. Ages are transformed to numeric type. 3) In weight column, weight with value 0 is removed. Also, weight is transformed to numeric type. 4) Race and sex are transformed to factors. 5) In BMI column, remove invalid values that are larger than 100, and turn the data type to numerics.  
+
+Parameters are tunned for number of trees (ntree), selective features for splitting trees (mtry), and splitting criteria nodesize (nodesize). By calculating a grid of these 3 parameters, and comparing the mean squared error, the optimal tunning parameters are: ntree = 1000, mtry = 2, and nodesize = 10.  
+
+A random forest model is then built based on the optimal parameters. Feature importance can be seen in FigureXXX. Weight is the most important feature that deterimines BMI, while race is the least important feature.  
+
+The MSE of training dataset = 7.05, and the MSE of tesing dataset = 9.47.  
+
+```{r random forest}  
+library(randomForest)
+#######################################
+# clean data
+#######################################
+# remove NA
+df = data[ ,c(2, 5, 6, 7, 3)]  # X = age, weight, race, sex, y = bmi
+df[df == 'Not provided'] = NA
+df = df[complete.cases(df), ]
+dim(df)
+
+# age col: let 'child' = 10s, 'teen' = 20s
+df$age_cat[df$age_cat == 'child'] = '10s'
+df$age_cat[df$age_cat == 'teen'] = '20s'
+
+# remove string in age column
+df$age_cat = gsub('0.*', '0', df$age_cat)
+df$age_cat = as.numeric(df$age_cat)
+
+# weight col: change data type 
+df$weight_kg[df$weight_kg == 0] = NA    # remove weight = 0 rows
+df = df[complete.cases(df), ]
+df$weight_kg = as.numeric(df$weight_kg)
+
+# race and sex cols: change data type 
+df$race = as.factor(df$race)
+df$sex = as.factor(df$sex)
+sapply(df, class)
+
+# bmi col: remove bmi obs with bmi > 100
+df$bmi = as.numeric(df$bmi)   # change bmi to numerics
+df$bmi[df$bmi > 100] = NA
+df = df[complete.cases(df), ]  # Remove missing data 
+
+
+#######################################
+# random forest 
+#######################################
+# split training and testing sets
+set.seed(1)
+train_id = sample(nrow(df), size = floor(0.8* nrow(df))) 
+train = df[train_id, ] 
+test = df[-train_id, ]
+
+# tune parameters
+ntree_range = c(200,500,1000)
+mtry_range = c(1:10)
+nodesize_range = c(5,10,20)
+
+mse = array(0, dim = c(length(ntree_range), length(mtry_range), length(nodesize_range))) # initiation
+best_mse = Inf
+for(i in 1:length(ntree_range)){
+  for(j in 1:length(mtry_range)){
+    for(k in 1:length(nodesize_range)){
+      obj = randomForest(bmi~., data = train,
+                      ntree = ntree_range[i],
+                      mtry = mtry_range[j],
+                      nodesize = nodesize_range[k],
+                      importance = TRUE)
+      mse[i,j,k] = mean(obj$mse)
+
+      if (mse[i,j,k] < best_mse) {
+      best_mse = mse[i,j,k]
+      best_par = c(ntree_range[i],mtry_range[j],nodesize_range[k])
+      }
+    }
+  }
+}
+
+best_par
+
+# rf model 
+rf.fit = randomForest(bmi~., data = train,
+                      ntree = 1000,
+                      mtry = 2,
+                      nodesize = 10,
+                      importance = TRUE)
+varImpPlot(rf.fit,sort=TRUE, main = '')  # Feature importance
+
+
+# prediction 
+pred_train_rf = predict(rf.fit, train)             
+mse_rf_train = mean((pred_train_rf - train$bmi)^2)    #train error
+
+pred_test_rf = predict(rf.fit, test)
+mse_rf_test = mean((pred_test_rf - test$bmi)^2)      #test error
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
